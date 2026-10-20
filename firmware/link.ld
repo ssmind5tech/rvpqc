@@ -8,6 +8,7 @@ SECTIONS {
   .data : { *(.data .data.* .sdata .sdata.*) } > RAM
   .bss : { __bss_start = .; *(.bss .bss.* .sbss .sbss.* COMMON) . = ALIGN(4); __bss_end = .; } > RAM
   . = ALIGN(16);
+  __stack_limit = .;
   . += 0x200000;
   __stack_top = .;
 }

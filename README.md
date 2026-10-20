@@ -48,6 +48,70 @@ configuration's instructions and code size relative to the first.
 
 Results are printed and written to `results/results.json`, `results.csv` and `results.md`.
 
+## Running on a real board (C-DAC ARIES)
+
+rvpqc also runs on a C-DAC ARIES board (v2, v3 or ECO: THEJAS32 SoC, VEGA ET1031 RV32IM core at
+100 MHz), over the board's USB-serial port:
+
+```bash
+pip install pyserial
+python rvpqc.py --board aries --port /dev/ttyUSB0          # press RESET when asked
+python rvpqc.py --board aries --port /dev/ttyUSB0 --schemes ml-kem-768 ml-dsa-44 --iter 15
+```
+
+On the board, rvpqc measures:
+
+- **real cycles** from the core's own cycle counter, and the time at the board clock;
+- **instructions and CPI**, if the core also counts retired instructions;
+- **peak stack and peak heap**, within the board's 250 KB of SRAM.
+
+The same functional and differential checks run as under QEMU. The first run uploads a 2.5 KB
+resident loader through the boot ROM, which needs one press of RESET; every benchmark after that
+is loaded over the serial port. The loader also reports which counters the core implements:
+
+- **64-bit counter:** rvpqc reads it directly.
+- **32-bit counter only:** rvpqc recovers long operations from the board's machine timer.
+
+Results go to `results-aries/`. See [`board/README.md`](board/README.md) for the memory map
+and troubleshooting.
+
+All default schemes fit in the board's memory, including ML-DSA-87, whose signing needs 122 KB
+of stack. `--board qemu-sim` runs the same flow in QEMU with the board's memory map, so the
+hardware path can be checked without a board. On WSL, attach the board to Linux first with
+[usbipd-win](https://github.com/dorssel/usbipd-win).
+
+## Results on real hardware: C-DAC ARIES ECO
+
+Measured on the VEGA ET1031 core (RV32IM, 100 MHz) of a C-DAC ARIES ECO board, built with GCC 10.2
+at `-O2`. Times are medians of 5 runs (SLH-DSA: 1 run). All eight schemes passed the functional and
+differential checks on the board. The full table, with every operation, instruction count and
+code size, is in [`results-aries/results.md`](results-aries/results.md).
+
+| Algorithm | Operation | Time | Cycles per instruction | Peak stack |
+|---|---|---:|---:|---:|
+| ML-KEM-512 | encapsulation | 13.1 ms | 1.23 | 8.5 KB |
+| ML-KEM-768 | key generation | 19.1 ms | 1.19 | 9.9 KB |
+| ML-KEM-768 | encapsulation | 21.5 ms | 1.22 | 13.0 KB |
+| ML-KEM-768 | decapsulation | 24.9 ms | 1.26 | 14.0 KB |
+| ML-KEM-1024 | encapsulation | 32.8 ms | 1.21 | 18.5 KB |
+| ML-DSA-44 | signing (slowest run) | 85.2 ms (102.5 ms) | 1.21 | 50.4 KB |
+| ML-DSA-44 | verification | 41.1 ms | 1.14 | 35.0 KB |
+| ML-DSA-65 | signing (slowest run) | 217.3 ms (429.1 ms) | 1.22 | 77.4 KB |
+| ML-DSA-87 | signing (slowest run) | 152.7 ms (336.3 ms) | 1.16 | 119.4 KB |
+| ML-DSA-87 | verification | 117.4 ms | 1.11 | 90.4 KB |
+| SLH-DSA-SHA2-128f | signing | 5.59 s | 1.03 | 4.5 KB |
+| SLH-DSA-SHA2-128f | verification | 332 ms | 1.03 | 3.9 KB |
+| SLH-DSA-SHAKE-128f | signing | 26.1 s | 1.05 | 4.2 KB |
+
+What the board shows:
+
+- **ML-KEM is quick enough to use interactively on a 100 MHz microcontroller.** A full ML-KEM-768 key exchange (encapsulation plus decapsulation) takes 46 ms.
+- **ML-DSA-44 signs in about 85 ms, but the time varies widely.** The slowest of 5 runs took 102.5 ms. For ML-DSA-65 and ML-DSA-87 the slowest run took about twice the median. Devices with deadlines must budget for the worst case.
+- **The ET1031 is efficient: 1.03 to 1.27 cycles per instruction.** Hash-heavy SLH-DSA runs at almost one instruction per cycle. ML-KEM and ML-DSA have more loads and taken branches; a 2-instruction loop with a taken branch runs at 1.5 cycles per instruction on this core.
+- **Choose SLH-DSA's SHA-2 variants on 32-bit cores.** SHAKE-128f signs 4.7 times slower than SHA2-128f on the board, as predicted from the QEMU instruction counts.
+- **All schemes fit in the board's 250 KB of SRAM,** including ML-DSA-87, whose signing uses 119 KB of stack. Hash contexts need only 416 bytes of heap.
+- **QEMU's instruction counts match the chip's.** ML-KEM-768 encapsulation retired 1,758,633 instructions on the board. QEMU, with the same GCC 10.2, counted 1,758,102 with the earlier allocator. The 531-instruction difference (0.03%) is the reusing allocator added for the board. So QEMU instruction counts multiplied by the board's cycles per instruction predict real time well.
+
 ## How the measurements work
 
 - **Instruction counts** come from the RISC-V `instret` counter, read immediately before and after each operation. QEMU runs with `-icount shift=0`, which makes that counter exact (a calibration loop of exactly 2,001 instructions reads back as 2,001 plus the counter read itself). rvpqc reads the full 64-bit counter, because SLH-DSA's "s" variants exceed 4.3 billion instructions per signature, and it measures and subtracts the counter-reading overhead at start-up.
@@ -108,22 +172,22 @@ for both variants.
 
 ## Limitations
 
-- **Instructions are not cycles.** Real time depends on the core's pipeline and memory; on small in-order cores, multiplies, loads and taken branches often take more than one cycle. Cycle-accurate numbers need a real board or RTL simulation.
+- **Instructions are not cycles.** Under QEMU, real time depends on the core's pipeline and memory: on small in-order cores, multiplies, loads and taken branches often take more than one cycle. Use `--board aries` for real cycle counts.
 - **Portable reference code.** PQClean's `clean` implementations favor portability over speed. Optimized implementations, or custom instructions, can be much faster.
-- **A simple runtime.** The benchmark uses byte-wise `memcpy`/`memset` and a bump allocator. These are slower than an optimized C library, so counts are slightly conservative.
+- **A simple runtime.** The benchmark uses byte-wise `memcpy`/`memset` and a small allocator that reuses freed hash contexts, so the heap stays at 416 bytes even on a 256 KB board. These are slower than an optimized C library, so counts are slightly conservative. The reusing allocator adds a few hundred instructions per operation compared with the bump allocator of earlier versions: +748 for ML-KEM-768 encapsulation, or 0.04%.
 - **A generic core.** QEMU models a standard RISC-V core, not a specific chip.
 - **Toolchain-dependent counts.** Exact numbers change by a few percent between compiler versions; always compare results produced with the same toolchain (recorded in every results file).
 
 ## Roadmap
 
 - More algorithms: Falcon/FN-DSA and HQC once standardized.
-- Real-board timing on VEGA/ARIES and other RISC-V development boards.
+- Real-board timing: C-DAC ARIES is supported (`--board aries`); more RISC-V development boards next.
 - Cycle-accurate measurement through RTL simulation of open cores.
 - Optimized implementations alongside the portable ones, and custom acceleration instructions.
 
 ## Related project
 
-[qrvc](https://github.com/ssmind5tech/qrvc-v-0.1.0/tree/main/qrvc/qrvc), from the same team: an OpenQASM to RISC-V quantum
+[qrvc](https://github.com/ssmind5tech/qrvc), from the same team: an OpenQASM to RISC-V quantum
 extension compiler.
 
 ## License

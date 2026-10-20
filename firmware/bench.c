@@ -3,6 +3,8 @@
  * Built twice from the same source:
  *   - bare-metal RV32 (default): runs under QEMU with -icount, measures instructions retired
  *     (rdinstret) and stack high-water per operation, prints results over the UART;
+ *     with -DBOARD_MON it runs on a real board under the vegamon loader instead, counting
+ *     cycles (CNT1) and, if the core has a working instret, instructions (CNT2);
  *   - natively on the host (-DHOST): runs the same operations and prints only the output
  *     digests, for a differential check that the RISC-V build computes identical results.
  * Randomness is a deterministic SHAKE256 stream, so both builds see the same "random" bytes.
@@ -46,9 +48,22 @@ int PQCLEAN_randombytes(uint8_t *out, size_t n) { shake256_inc_squeeze(out, n, &
 static void out_str(const char *s) { fputs(s, stdout); }
 static void finish(int code) { exit(code); }
 #else
-#define UART ((volatile uint8_t *)0x10000000u)
-static void out_str(const char *s) { while (*s) *UART = (uint8_t)*s++; }
+#ifndef UART_BASE
+#define UART_BASE 0x10000000u           /* QEMU 'virt' */
+#endif
+#ifndef UART_STRIDE
+#define UART_STRIDE 1                   /* THEJAS32 (ARIES): 4 */
+#endif
+#define UREG(off) (*(volatile uint8_t *)(UART_BASE + (off) * UART_STRIDE))
+static void out_char(char c) { while (!(UREG(5) & 0x20)) {} UREG(0) = (uint8_t)c; }
+static void out_str(const char *s) { while (*s) out_char(*s++); }
+#ifdef BOARD_MON
+void (*rvpqc_mon_return)(uint32_t);     /* set by start.S: back to the vegamon loader */
+static void finish(int code) { rvpqc_mon_return((uint32_t)code); for (;;) {} }
+#else
 static void finish(int code) { *(volatile uint32_t *)0x100000u = code ? 0x13333u | ((uint32_t)code << 16) : 0x5555u; for (;;) {} }
+#endif
+void rvpqc_fatal(void) { out_str("FAIL abort() called (out of heap memory?)\n"); finish(3); }
 #endif
 static void out_hex(const uint8_t *p, size_t n) {
     static const char h[] = "0123456789abcdef";
@@ -67,24 +82,48 @@ static void out_u32(uint32_t v) {
 #define MEASURE_END(op) do {} while (0)
 static void calibrate(void) {}
 #else
-#define STACK_PAINT_BYTES (768u * 1024u)
 #define PAINT 0xA5C3E1F7u
-/* 64-bit instret (CSRs 0xC02 low, 0xC82 high on RV32): SLH-DSA "s" variants can exceed 2^32. */
-static inline uint64_t rd_instret(void) {
-    uint32_t hi, lo, hi2;
-    do {
-        __asm__ volatile("csrr %0, 0xc82" : "=r"(hi));
-        __asm__ volatile("csrr %0, 0xc02" : "=r"(lo));
-        __asm__ volatile("csrr %0, 0xc82" : "=r"(hi2));
-    } while (hi != hi2);
-    return ((uint64_t)hi << 32) | lo;
-}
-static uint64_t t0, overhead;
+/* 64-bit counters on RV32 (low CSR, high CSR).  CNT1 defaults to instret (0xC02/0xC82), which QEMU
+ * -icount makes exact; on a board the host picks mcycle or cycle.  CNT2 (optional) is a second
+ * counter, e.g. minstret next to mcycle. */
+#ifndef CNT1_LO
+#define CNT1_LO 0xc02
+#define CNT1_HI 0xc82
+#endif
+#define STR_(x) #x
+#define STR(x) STR_(x)
+#define RD64(lo, hi) ({ uint32_t h_, l_, h2_;                                   \
+        do { __asm__ volatile("csrr %0, " STR(hi) : "=r"(h_));                   \
+             __asm__ volatile("csrr %0, " STR(lo) : "=r"(l_));                   \
+             __asm__ volatile("csrr %0, " STR(hi) : "=r"(h2_)); } while (h_ != h2_); \
+        ((uint64_t)h_ << 32) | l_; })
+#define RD32(lo) ({ uint32_t l_; __asm__ volatile("csrr %0, " STR(lo) : "=r"(l_)); (uint64_t)l_; })
+/* A core without the high half (CNTx_HI undefined) gives 32-bit counts: differences are taken
+ * modulo 2^32, so an operation longer than 2^32 counts wraps (the host flags those). */
+#ifdef CNT1_HI
+static inline uint64_t rd_cnt1(void) { return RD64(CNT1_LO, CNT1_HI); }
+#define DIFF1(a, b) ((a) - (b))
+#else
+static inline uint64_t rd_cnt1(void) { return RD32(CNT1_LO); }
+#define DIFF1(a, b) ((uint64_t)(uint32_t)((a) - (b)))
+#endif
+#if defined(CNT2_LO) && defined(CNT2_HI)
+static inline uint64_t rd_cnt2(void) { return RD64(CNT2_LO, CNT2_HI); }
+#define DIFF2(a, b) ((a) - (b))
+#elif defined(CNT2_LO)
+static inline uint64_t rd_cnt2(void) { return RD32(CNT2_LO); }
+#define DIFF2(a, b) ((uint64_t)(uint32_t)((a) - (b)))
+#else
+static inline uint64_t rd_cnt2(void) { return 0; }
+#define DIFF2(a, b) ((a) - (b))
+#endif
+extern uint32_t __stack_limit[];        /* linker script: lowest address the stack may reach */
+static uint64_t t1, t2, overhead1, overhead2;
 static volatile uint32_t *paint_lo;
 static void __attribute__((noinline)) stack_paint(void) {
     volatile uint32_t here;
     volatile uint32_t *top = &here - 64;            /* leave this frame alone */
-    paint_lo = top - STACK_PAINT_BYTES / 4;
+    paint_lo = (volatile uint32_t *)__stack_limit;
     for (volatile uint32_t *p = paint_lo; p < top; p++) *p = PAINT;
 }
 static uint32_t __attribute__((noinline)) stack_used(void) {
@@ -99,21 +138,53 @@ static void out_u64(uint64_t v) {
     do { b[--i] = (char)('0' + (int)(v % 10)); v /= 10; } while (v);
     out_str(b + i);
 }
-static void report(const char *op, uint64_t insns, uint32_t stack) {
-    out_str("R "); out_str(op); out_str(" "); out_u64(insns); out_str(" "); out_u32(stack); out_str("\n");
+static void report(const char *op, uint64_t v1, uint32_t stack, uint64_t v2) {
+    out_str("R "); out_str(op); out_str(" "); out_u64(v1); out_str(" "); out_u32(stack);
+#ifdef CNT2_LO
+    out_str(" "); out_u64(v2);
+#else
+    (void)v2;
+#endif
+    out_str("\n");
 }
-static void calibrate(void) {      /* instructions the measurement itself adds */
-    uint64_t a = rd_instret(), b = rd_instret();
-    overhead = b - a;
+static void calibrate(void) {      /* counts the measurement itself adds */
+    uint64_t a = rd_cnt1(), b = rd_cnt1();
+    overhead1 = DIFF1(b, a);
+    uint64_t c = rd_cnt2(); (void)rd_cnt1(); (void)rd_cnt1(); uint64_t d = rd_cnt2();
+    overhead2 = DIFF2(d, c);
 }
-#define MEASURE_BEGIN() do { stack_paint(); t0 = rd_instret(); } while (0)
-#define MEASURE_END(op) do { uint64_t t1 = rd_instret(); report(op, t1 - t0 - overhead, stack_used()); } while (0)
+#if !defined(CNT1_HI) && defined(MTIME_ADDR)
+/* 32-bit cycle counter: the board's 64-bit machine timer (cycles / MTIME_DIV) says how many whole
+ * 2^32 wraps happened; the cycle counter gives the exact remainder. */
+static inline uint64_t rd_mtime(void) {
+    volatile uint32_t *m = (volatile uint32_t *)MTIME_ADDR;
+    uint32_t hi, lo;
+    do { hi = m[1]; lo = m[0]; } while (hi != m[1]);
+    return ((uint64_t)hi << 32) | lo;
+}
+static uint64_t tm0;
+static uint64_t unwrap1(uint64_t c32) {
+    uint64_t est = (rd_mtime() - tm0) * MTIME_DIV;           /* within MTIME_DIV cycles of the truth */
+    uint64_t wraps = (est + 0x80000000ull - c32) >> 32;      /* nearest whole number of wraps */
+    return c32 + (wraps << 32);
+}
+#define MT_BEGIN() (tm0 = rd_mtime())
+#else
+#define unwrap1(c) (c)
+#define MT_BEGIN() ((void)0)
+#endif
+#define MEASURE_BEGIN() do { stack_paint(); MT_BEGIN(); t2 = rd_cnt2(); t1 = rd_cnt1(); } while (0)
+#define MEASURE_END(op) do { uint64_t e1 = rd_cnt1(), e2 = rd_cnt2(); \
+        report(op, unwrap1(DIFF1(e1, t1)) - overhead1, stack_used(), DIFF2(e2, t2) - overhead2); } while (0)
 #endif
 
 /* ------------------------------------------------------------ operations */
 #if defined(SLH)
 #define PRM CAT(slh_dsa_, SLH)
-static uint8_t pk[64], sk[128], sig[49856], addrnd[32];
+#ifndef SLH_SIG_MAX
+#define SLH_SIG_MAX 49856                  /* largest SLH-DSA signature (256f) */
+#endif
+static uint8_t pk[64], sk[128], sig[SLH_SIG_MAX], addrnd[32];
 static size_t pk_len, sk_len, sig_len;
 static const uint8_t msg[] = "rvpqc benchmark message: 59 bytes of data to be signed....";
 static const uint8_t ctxs[] = "rvpqc";
@@ -191,6 +262,9 @@ int main(void) {
 #endif
         digest("out", it);
     }
+#ifndef HOST
+    { size_t rvpqc_heap_peak(void); out_str("M heap "); out_u32((uint32_t)rvpqc_heap_peak()); out_str("\n"); }
+#endif
     out_str("END\n");
     finish(0);
     return 0;

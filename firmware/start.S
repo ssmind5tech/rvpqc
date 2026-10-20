@@ -8,5 +8,10 @@ _start:
     sw   zero, 0(t0)
     addi t0, t0, 4
     j    1b
-2:  call main
+2:
+#ifdef BOARD_MON
+    la   t0, rvpqc_mon_return   # vegamon passes its return address in a0
+    sw   a0, 0(t0)
+#endif
+    call main
 3:  j    3b

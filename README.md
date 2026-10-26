@@ -112,6 +112,31 @@ What the board shows:
 - **All schemes fit in the board's 250 KB of SRAM,** including ML-DSA-87, whose signing uses 119 KB of stack. Hash contexts need only 416 bytes of heap.
 - **QEMU's instruction counts match the chip's.** ML-KEM-768 encapsulation retired 1,758,633 instructions on the board. QEMU, with the same GCC 10.2, counted 1,758,102 with the earlier allocator. The 531-instruction difference (0.03%) is the reusing allocator added for the board. So QEMU instruction counts multiplied by the board's cycles per instruction predict real time well.
 
+### One compiler flag: 18–30% faster on the ET1031
+
+Building with `-fno-schedule-insns` (no other change) cut real cycles by 18–30% on the board,
+made the code 11–14% smaller, and produced byte-identical outputs. Full data:
+[`results-aries-nosched/results.md`](results-aries-nosched/results.md).
+
+| Algorithm | Operation | `-O2` | `-O2 -fno-schedule-insns` | Faster by |
+|---|---|---:|---:|---:|
+| ML-KEM-768 | key generation | 19.1 ms | 14.1 ms | 27% |
+| ML-KEM-768 | encapsulation | 21.5 ms | 16.4 ms | 24% |
+| ML-KEM-768 | decapsulation | 24.9 ms | 19.9 ms | 20% |
+| ML-DSA-44 | key generation | 39.1 ms | 27.3 ms | 30% |
+| ML-DSA-44 | signing (median) | 85.2 ms | 69.6 ms | 18% |
+| ML-DSA-44 | verification | 41.1 ms | 29.9 ms | 27% |
+
+Why: before register allocation, GCC's instruction scheduler moves loads early to hide latency.
+On RV32 that keeps more values live than there are registers, so the compiler spills them to the
+stack. On a simple in-order core like the ET1031, the spills cost more than the reordering saves.
+This is a known GCC behaviour, not a new discovery; the measurement on VEGA with post-quantum code
+is what's new here. Try it on your own core:
+
+```bash
+python rvpqc.py --board aries --port /dev/ttyUSB0 --cflags="-fno-schedule-insns" --out results-aries-nosched
+```
+
 ## How the measurements work
 
 - **Instruction counts** come from the RISC-V `instret` counter, read immediately before and after each operation. QEMU runs with `-icount shift=0`, which makes that counter exact (a calibration loop of exactly 2,001 instructions reads back as 2,001 plus the counter read itself). rvpqc reads the full 64-bit counter, because SLH-DSA's "s" variants exceed 4.3 billion instructions per signature, and it measures and subtracts the counter-reading overhead at start-up.
